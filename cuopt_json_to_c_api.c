@@ -8,12 +8,57 @@
  * 4. Display the results
  */
 
+#define _POSIX_C_SOURCE 199309L
+
 #include <cuopt/linear_programming/cuopt_c.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <cJSON.h>
+#include <time.h>
+
+// Global flags to control features (disabled by default)
+static int timing_enabled = 0;
+static char* mps_output_file = NULL;
+
+// Timing utility functions
+typedef struct {
+    struct timespec start_time;
+    struct timespec end_time;
+} Timer;
+
+void start_timer(Timer* timer) {
+    if (timing_enabled) {
+        clock_gettime(CLOCK_MONOTONIC, &timer->start_time);
+    }
+}
+
+double end_timer(Timer* timer) {
+    if (!timing_enabled) {
+        return 0.0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &timer->end_time);
+    double elapsed = (timer->end_time.tv_sec - timer->start_time.tv_sec) + 
+                    (timer->end_time.tv_nsec - timer->start_time.tv_nsec) / 1e9;
+    return elapsed;
+}
+
+void log_timestamp(const char* phase) {
+    if (!timing_enabled) {
+        return;
+    }
+    struct timespec current_time;
+    clock_gettime(CLOCK_MONOTONIC, &current_time);
+    printf("[TIMESTAMP] %s: %ld.%09ld\n", phase, current_time.tv_sec, current_time.tv_nsec);
+}
+
+void log_phase_duration(const char* phase, double duration) {
+    if (!timing_enabled) {
+        return;
+    }
+    printf("[DURATION] %s: %.6f seconds\n", phase, duration);
+}
 
 // Helper function to convert termination status to string
 const char* termination_status_to_string(cuopt_int_t termination_status)
@@ -103,6 +148,14 @@ void free_problem_data(ProblemData* data) {
 
 // Function to parse cuOpt JSON file
 int parse_cuopt_json(const char* filename, ProblemData* data) {
+    Timer timer;
+    log_timestamp("JSON_PARSE_START");
+    start_timer(&timer);
+    
+    log_timestamp("FILE_READ_START");
+    Timer file_timer;
+    start_timer(&file_timer);
+    
     FILE* file = fopen(filename, "r");
     if (!file) {
         printf("Error: Cannot open file %s\n", filename);
@@ -125,13 +178,25 @@ int parse_cuopt_json(const char* filename, ProblemData* data) {
     file_content[bytes_read] = '\0';
     fclose(file);
     
+    double file_read_time = end_timer(&file_timer);
+    log_timestamp("FILE_READ_END");
+    log_phase_duration("FILE_READ", file_read_time);
+    
     if (bytes_read != (size_t)file_size) {
         printf("Warning: Only read %zu bytes out of %ld expected\n", bytes_read, file_size);
     }
     
     // Parse JSON
+    log_timestamp("JSON_PARSE_STRUCTURE_START");
+    Timer json_parse_timer;
+    start_timer(&json_parse_timer);
+    
     cJSON* json = cJSON_Parse(file_content);
     free(file_content);
+    
+    double json_parse_time = end_timer(&json_parse_timer);
+    log_timestamp("JSON_PARSE_STRUCTURE_END");
+    log_phase_duration("JSON_PARSE_STRUCTURE", json_parse_time);
     
     if (!json) {
         printf("Error: Failed to parse JSON\n");
@@ -139,6 +204,10 @@ int parse_cuopt_json(const char* filename, ProblemData* data) {
     }
     
     // Parse CSR constraint matrix
+    log_timestamp("CSR_MATRIX_PARSE_START");
+    Timer csr_timer;
+    start_timer(&csr_timer);
+    
     cJSON* csr_matrix = cJSON_GetObjectItem(json, "csr_constraint_matrix");
     if (!csr_matrix) {
         printf("Error: Missing csr_constraint_matrix in JSON\n");
@@ -164,17 +233,38 @@ int parse_cuopt_json(const char* filename, ProblemData* data) {
     data->column_indices = malloc(data->nnz * sizeof(cuopt_int_t));
     data->matrix_values = malloc(data->nnz * sizeof(cuopt_float_t));
     
-    // Parse CSR data
-    for (int i = 0; i <= data->num_constraints; i++) {
-        data->row_offsets[i] = cJSON_GetArrayItem(offsets, i)->valueint;
+    // Parse CSR data - OPTIMIZED VERSION
+    // Use cJSON_ArrayForEach for O(n) complexity instead of O(n²)
+    int i = 0;
+    cJSON* offset_item;
+    cJSON_ArrayForEach(offset_item, offsets) {
+        data->row_offsets[i] = offset_item->valueint;
+        i++;
     }
     
-    for (int i = 0; i < data->nnz; i++) {
-        data->column_indices[i] = cJSON_GetArrayItem(indices, i)->valueint;
-        data->matrix_values[i] = cJSON_GetArrayItem(values, i)->valuedouble;
+    i = 0;
+    cJSON* index_item;
+    cJSON_ArrayForEach(index_item, indices) {
+        data->column_indices[i] = index_item->valueint;
+        i++;
     }
+    
+    i = 0;
+    cJSON* value_item;
+    cJSON_ArrayForEach(value_item, values) {
+        data->matrix_values[i] = value_item->valuedouble;
+        i++;
+    }
+    
+    double csr_time = end_timer(&csr_timer);
+    log_timestamp("CSR_MATRIX_PARSE_END");
+    log_phase_duration("CSR_MATRIX_PARSE", csr_time);
     
     // Parse objective data
+    log_timestamp("OBJECTIVE_PARSE_START");
+    Timer objective_timer;
+    start_timer(&objective_timer);
+    
     cJSON* objective_data = cJSON_GetObjectItem(json, "objective_data");
     if (!objective_data) {
         printf("Error: Missing objective_data in JSON\n");
@@ -186,18 +276,32 @@ int parse_cuopt_json(const char* filename, ProblemData* data) {
     data->num_variables = cJSON_GetArraySize(obj_coeffs);
     
     data->objective_coefficients = malloc(data->num_variables * sizeof(cuopt_float_t));
-    for (int i = 0; i < data->num_variables; i++) {
-        data->objective_coefficients[i] = cJSON_GetArrayItem(obj_coeffs, i)->valuedouble;
+    // OPTIMIZED: Use cJSON_ArrayForEach for O(n) complexity
+    i = 0;
+    cJSON* coeff_item;
+    cJSON_ArrayForEach(coeff_item, obj_coeffs) {
+        data->objective_coefficients[i] = coeff_item->valuedouble;
+        i++;
     }
     
     cJSON* offset = cJSON_GetObjectItem(objective_data, "offset");
     data->objective_offset = offset ? offset->valuedouble : 0.0;
-    
+    // Print the objective offset value
+    printf("Objective offset: %g\n", data->objective_offset);   
+
     // Parse maximize flag
     cJSON* maximize = cJSON_GetObjectItem(json, "maximize");
     data->objective_sense = (maximize && cJSON_IsTrue(maximize)) ? CUOPT_MAXIMIZE : CUOPT_MINIMIZE;
     
+    double objective_time = end_timer(&objective_timer);
+    log_timestamp("OBJECTIVE_PARSE_END");
+    log_phase_duration("OBJECTIVE_PARSE", objective_time);
+    
     // Parse constraint bounds
+    log_timestamp("CONSTRAINT_BOUNDS_PARSE_START");
+    Timer constraint_timer;
+    start_timer(&constraint_timer);
+    
     cJSON* constraint_bounds = cJSON_GetObjectItem(json, "constraint_bounds");
     if (constraint_bounds) {
         data->constraint_lower_bounds = malloc(data->num_constraints * sizeof(cuopt_float_t));
@@ -207,9 +311,19 @@ int parse_cuopt_json(const char* filename, ProblemData* data) {
         cJSON* upper_bounds = cJSON_GetObjectItem(constraint_bounds, "upper_bounds");
         
         if (lower_bounds && upper_bounds) {
-            for (int i = 0; i < data->num_constraints; i++) {
-                data->constraint_lower_bounds[i] = parse_numeric_value(cJSON_GetArrayItem(lower_bounds, i));
-                data->constraint_upper_bounds[i] = parse_numeric_value(cJSON_GetArrayItem(upper_bounds, i));
+            // OPTIMIZED: Use cJSON_ArrayForEach for O(n) complexity
+            i = 0;
+            cJSON* lower_item;
+            cJSON_ArrayForEach(lower_item, lower_bounds) {
+                data->constraint_lower_bounds[i] = parse_numeric_value(lower_item);
+                i++;
+            }
+            
+            i = 0;
+            cJSON* upper_item;
+            cJSON_ArrayForEach(upper_item, upper_bounds) {
+                data->constraint_upper_bounds[i] = parse_numeric_value(upper_item);
+                i++;
             }
         } else {
             // Fallback to bounds and types format
@@ -217,9 +331,13 @@ int parse_cuopt_json(const char* filename, ProblemData* data) {
             cJSON* types = cJSON_GetObjectItem(constraint_bounds, "types");
             
             if (bounds && types) {
-                for (int i = 0; i < data->num_constraints; i++) {
-                    cuopt_float_t bound_value = parse_numeric_value(cJSON_GetArrayItem(bounds, i));
-                    char* type = cJSON_GetArrayItem(types, i)->valuestring;
+                // OPTIMIZED: Use parallel iteration with cJSON_ArrayForEach
+                i = 0;
+                cJSON* bound_item = bounds->child;
+                cJSON* type_item = types->child;
+                while (bound_item && type_item && i < data->num_constraints) {
+                    cuopt_float_t bound_value = parse_numeric_value(bound_item);
+                    char* type = type_item->valuestring;
                     
                     if (strcmp(type, "L") == 0) {  // Less than or equal
                         data->constraint_lower_bounds[i] = -CUOPT_INFINITY;
@@ -231,12 +349,24 @@ int parse_cuopt_json(const char* filename, ProblemData* data) {
                         data->constraint_lower_bounds[i] = bound_value;
                         data->constraint_upper_bounds[i] = bound_value;
                     }
+                    
+                    bound_item = bound_item->next;
+                    type_item = type_item->next;
+                    i++;
                 }
             }
         }
     }
     
+    double constraint_time = end_timer(&constraint_timer);
+    log_timestamp("CONSTRAINT_BOUNDS_PARSE_END");
+    log_phase_duration("CONSTRAINT_BOUNDS_PARSE", constraint_time);
+    
     // Parse variable bounds
+    log_timestamp("VARIABLE_BOUNDS_PARSE_START");
+    Timer variable_bounds_timer;
+    start_timer(&variable_bounds_timer);
+    
     cJSON* variable_bounds = cJSON_GetObjectItem(json, "variable_bounds");
     if (variable_bounds) {
         data->variable_lower_bounds = malloc(data->num_variables * sizeof(cuopt_float_t));
@@ -245,23 +375,45 @@ int parse_cuopt_json(const char* filename, ProblemData* data) {
         cJSON* var_lower = cJSON_GetObjectItem(variable_bounds, "lower_bounds");
         cJSON* var_upper = cJSON_GetObjectItem(variable_bounds, "upper_bounds");
         
-        for (int i = 0; i < data->num_variables; i++) {
-            data->variable_lower_bounds[i] = parse_numeric_value(cJSON_GetArrayItem(var_lower, i));
-            data->variable_upper_bounds[i] = parse_numeric_value(cJSON_GetArrayItem(var_upper, i));
+        // OPTIMIZED: Use cJSON_ArrayForEach for O(n) complexity
+        i = 0;
+        cJSON* var_lower_item;
+        cJSON_ArrayForEach(var_lower_item, var_lower) {
+            data->variable_lower_bounds[i] = parse_numeric_value(var_lower_item);
+            i++;
+        }
+        
+        i = 0;
+        cJSON* var_upper_item;
+        cJSON_ArrayForEach(var_upper_item, var_upper) {
+            data->variable_upper_bounds[i] = parse_numeric_value(var_upper_item);
+            i++;
         }
     }
     
+    double variable_bounds_time = end_timer(&variable_bounds_timer);
+    log_timestamp("VARIABLE_BOUNDS_PARSE_END");
+    log_phase_duration("VARIABLE_BOUNDS_PARSE", variable_bounds_time);
+    
     // Parse variable types
+    log_timestamp("VARIABLE_TYPES_PARSE_START");
+    Timer variable_types_timer;
+    start_timer(&variable_types_timer);
+    
     cJSON* variable_types = cJSON_GetObjectItem(json, "variable_types");
     if (variable_types) {
         data->variable_types = malloc(data->num_variables * sizeof(char));
-        for (int i = 0; i < data->num_variables; i++) {
-            char* type_str = cJSON_GetArrayItem(variable_types, i)->valuestring;
+        // OPTIMIZED: Use cJSON_ArrayForEach for O(n) complexity
+        i = 0;
+        cJSON* type_item;
+        cJSON_ArrayForEach(type_item, variable_types) {
+            char* type_str = type_item->valuestring;
             if (strcmp(type_str, "I") == 0) {
                 data->variable_types[i] = CUOPT_INTEGER;
             } else {
                 data->variable_types[i] = CUOPT_CONTINUOUS;
             }
+            i++;
         }
     } else {
         // Default to continuous variables
@@ -271,12 +423,25 @@ int parse_cuopt_json(const char* filename, ProblemData* data) {
         }
     }
     
+    double variable_types_time = end_timer(&variable_types_timer);
+    log_timestamp("VARIABLE_TYPES_PARSE_END");
+    log_phase_duration("VARIABLE_TYPES_PARSE", variable_types_time);
+    
     cJSON_Delete(json);
+    
+    double total_parse_time = end_timer(&timer);
+    log_timestamp("JSON_PARSE_END");
+    log_phase_duration("JSON_PARSE_TOTAL", total_parse_time);
+    
     return 0;
 }
 
 // Function to solve the problem using cuOpt C API
 int solve_problem(const ProblemData* data) {
+    Timer timer;
+    log_timestamp("SOLVE_START");
+    start_timer(&timer);
+    
     cuOptOptimizationProblem problem = NULL;
     cuOptSolverSettings settings = NULL;
     cuOptSolution solution = NULL;
@@ -287,6 +452,10 @@ int solve_problem(const ProblemData* data) {
            data->num_constraints, data->num_variables, data->nnz);
     
     // Create the problem using ranged formulation
+    log_timestamp("PROBLEM_CREATION_START");
+    Timer problem_timer;
+    start_timer(&problem_timer);
+    
     status = cuOptCreateRangedProblem(data->num_constraints,
                                      data->num_variables,
                                      data->objective_sense,
@@ -297,10 +466,14 @@ int solve_problem(const ProblemData* data) {
                                      data->matrix_values,
                                      data->constraint_lower_bounds,
                                      data->constraint_upper_bounds,
-                                     data->variable_lower_bounds,
-                                     data->variable_upper_bounds,
+				     data->variable_lower_bounds,
+				     data->variable_upper_bounds,
                                      data->variable_types,
                                      &problem);
+    
+    double problem_time = end_timer(&problem_timer);
+    log_timestamp("PROBLEM_CREATION_END");
+    log_phase_duration("PROBLEM_CREATION", problem_time);
     
     if (status != CUOPT_SUCCESS) {
         printf("Error creating problem: %d\n", status);
@@ -308,6 +481,10 @@ int solve_problem(const ProblemData* data) {
     }
     
     // Create solver settings
+    log_timestamp("SOLVER_SETTINGS_START");
+    Timer settings_timer;
+    start_timer(&settings_timer);
+    
     status = cuOptCreateSolverSettings(&settings);
     if (status != CUOPT_SUCCESS) {
         printf("Error creating solver settings: %d\n", status);
@@ -325,14 +502,41 @@ int solve_problem(const ProblemData* data) {
         printf("Warning: Could not set time limit: %d\n", status);
     }
     
+    // Set MPS output file if requested
+    if (mps_output_file) {
+        status = cuOptSetParameter(settings, CUOPT_USER_PROBLEM_FILE, mps_output_file);
+        if (status != CUOPT_SUCCESS) {
+            printf("Warning: Could not set MPS output file: %d\n", status);
+        } else {
+            printf("MPS file will be written to: %s\n", mps_output_file);
+        }
+    }
+    
+    double settings_time = end_timer(&settings_timer);
+    log_timestamp("SOLVER_SETTINGS_END");
+    log_phase_duration("SOLVER_SETTINGS", settings_time);
+    
     // Solve the problem
+    log_timestamp("SOLVER_EXECUTION_START");
+    Timer solve_timer;
+    start_timer(&solve_timer);
+    
     status = cuOptSolve(problem, settings, &solution);
+    
+    double solve_time_measured = end_timer(&solve_timer);
+    log_timestamp("SOLVER_EXECUTION_END");
+    log_phase_duration("SOLVER_EXECUTION", solve_time_measured);
+    
     if (status != CUOPT_SUCCESS) {
         printf("Error solving problem: %d\n", status);
         goto CLEANUP;
     }
     
     // Get and display results
+    log_timestamp("RESULT_EXTRACTION_START");
+    Timer results_timer;
+    start_timer(&results_timer);
+    
     cuopt_float_t solve_time;
     cuopt_int_t termination_status;
     cuopt_float_t objective_value;
@@ -363,6 +567,10 @@ int solve_problem(const ProblemData* data) {
     printf("Objective value: %f\n", objective_value);
     
     // Get and print solution variables (first 20 or fewer)
+    log_timestamp("SOLUTION_EXTRACTION_START");
+    Timer solution_timer;
+    start_timer(&solution_timer);
+    
     cuopt_float_t* solution_values = malloc(data->num_variables * sizeof(cuopt_float_t));
     status = cuOptGetPrimalSolution(solution, solution_values);
     if (status == CUOPT_SUCCESS) {
@@ -378,6 +586,10 @@ int solve_problem(const ProblemData* data) {
         printf("Error getting solution values: %d\n", status);
     }
     free(solution_values);
+    
+    double solution_time = end_timer(&solution_timer);
+    log_timestamp("SOLUTION_EXTRACTION_END");
+    log_phase_duration("SOLUTION_EXTRACTION", solution_time);
     
     // Check if this is a MIP and get MIP-specific information
     cuopt_int_t is_mip;
@@ -396,31 +608,92 @@ int solve_problem(const ProblemData* data) {
         }
     }
     
+    double results_time = end_timer(&results_timer);
+    log_timestamp("RESULT_EXTRACTION_END");
+    log_phase_duration("RESULT_EXTRACTION", results_time);
+
 CLEANUP:
+    log_timestamp("CLEANUP_START");
+    Timer cleanup_timer;
+    start_timer(&cleanup_timer);
+    
     cuOptDestroyProblem(&problem);
     cuOptDestroySolverSettings(&settings);
     cuOptDestroySolution(&solution);
+    
+    double cleanup_time = end_timer(&cleanup_timer);
+    log_timestamp("CLEANUP_END");
+    log_phase_duration("CLEANUP", cleanup_time);
+    
+    double total_solve_time = end_timer(&timer);
+    log_timestamp("SOLVE_END");
+    log_phase_duration("SOLVE_TOTAL", total_solve_time);
     
     return status;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        printf("Usage: %s <cuopt_json_file>\n", argv[0]);
+    char* json_file = NULL;
+    
+    // Parse command-line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--timing") == 0 || strcmp(argv[i], "-t") == 0) {
+            timing_enabled = 1;
+        } else if (strcmp(argv[i], "--mps-output") == 0) {
+            if (i + 1 >= argc) {
+                printf("Error: --mps-output requires a filename\n");
+                return 1;
+            }
+            mps_output_file = argv[++i];
+        } else if (argv[i][0] == '-') {
+            printf("Error: Unknown option '%s'\n", argv[i]);
+            printf("Usage: %s [--timing|-t] [--mps-output <file>] <cuopt_json_file>\n", argv[0]);
+            printf("\nOptions:\n");
+            printf("  --timing, -t           Enable detailed performance timing output\n");
+            printf("  --mps-output <file>    Write problem to MPS file\n");
+            printf("\nThis program reads a cuOpt JSON file and solves it using the cuOpt C API.\n");
+            printf("The JSON file should contain LP or MIP problem data in cuOpt format.\n");
+            return 1;
+        } else if (json_file == NULL) {
+            json_file = argv[i];
+        } else {
+            printf("Error: Multiple JSON files specified\n");
+            printf("Usage: %s [--timing|-t] [--mps-output <file>] <cuopt_json_file>\n", argv[0]);
+            return 1;
+        }
+    }
+    
+    if (json_file == NULL) {
+        printf("Usage: %s [--timing|-t] [--mps-output <file>] <cuopt_json_file>\n", argv[0]);
+        printf("\nOptions:\n");
+        printf("  --timing, -t           Enable detailed performance timing output\n");
+        printf("  --mps-output <file>    Write problem to MPS file\n");
         printf("\nThis program reads a cuOpt JSON file and solves it using the cuOpt C API.\n");
         printf("The JSON file should contain LP or MIP problem data in cuOpt format.\n");
         return 1;
     }
+    
+    log_timestamp("PROGRAM_START");
+    Timer main_timer;
+    start_timer(&main_timer);
+    
+    log_timestamp("INITIALIZATION_START");
+    Timer init_timer;
+    start_timer(&init_timer);
     
     ProblemData data;
     memset(&data, 0, sizeof(ProblemData));
     
     printf("cuOpt JSON Solver\n");
     printf("=================\n");
-    printf("Reading JSON file: %s\n", argv[1]);
+    printf("Reading JSON file: %s\n", json_file);
+    
+    double init_time = end_timer(&init_timer);
+    log_timestamp("INITIALIZATION_END");
+    log_phase_duration("INITIALIZATION", init_time);
     
     // Parse the JSON file
-    if (parse_cuopt_json(argv[1], &data) != 0) {
+    if (parse_cuopt_json(json_file, &data) != 0) {
         printf("Failed to parse JSON file\n");
         free_problem_data(&data);
         return 1;
@@ -432,7 +705,19 @@ int main(int argc, char* argv[]) {
     cuopt_int_t solve_status = solve_problem(&data);
     
     // Clean up
+    log_timestamp("MAIN_CLEANUP_START");
+    Timer main_cleanup_timer;
+    start_timer(&main_cleanup_timer);
+    
     free_problem_data(&data);
+    
+    double main_cleanup_time = end_timer(&main_cleanup_timer);
+    log_timestamp("MAIN_CLEANUP_END");
+    log_phase_duration("MAIN_CLEANUP", main_cleanup_time);
+    
+    double total_program_time = end_timer(&main_timer);
+    log_timestamp("PROGRAM_END");
+    log_phase_duration("PROGRAM_TOTAL", total_program_time);
     
     if (solve_status == CUOPT_SUCCESS) {
         printf("\nSolver completed successfully!\n");

@@ -54,13 +54,17 @@ help:
 	@echo "Variables you may need to set:"
 	@echo "  CUOPT_INCLUDE_PATH  - Path to cuOpt include directory"
 	@echo "  CUOPT_LIBRARY_PATH  - Path to cuOpt library directory"
+	@echo "  CONDA_ENV          - Name of conda environment to search in"
 	@echo ""
 	@echo "Example usage:"
 	@echo "  # If cuOpt is installed in system paths:"
 	@echo "  make"
 	@echo ""
-	@echo "  # If cuOpt is built locally (from c_json directory):"
+	@echo "  # If cuOpt is built locally you can use absolute or relative paths:"
 	@echo "  make CUOPT_INCLUDE_PATH=../cpp/include CUOPT_LIBRARY_PATH=../cpp/build"
+	@echo ""
+	@echo "  # To search for a specific conda environment (under miniforge3):"
+	@echo "  make CONDA_ENV=cuopt_dev"
 	@echo ""
 	@echo "  # Custom compiler or flags:"
 	@echo "  make CC=clang CFLAGS=\"-O3 -g\""
@@ -89,10 +93,17 @@ else
     LIBS = -lcuopt -lcjson -lm
 endif
 
-# Auto-detect cuOpt paths if not specified
+# Auto-detect cuOpt paths if not specified (skip for clean targets)
+ifeq ($(filter clean,$(MAKECMDGOALS)),)
 ifndef CUOPT_INCLUDE_PATH
-    # Search order: current conda env, other conda envs, local build, system paths
-    SEARCH_PATHS := $(CONDA_PREFIX) /home/tmckay/miniforge3/envs/cuopt_dev /usr/include /usr/local/include ..
+    # Search order: specific conda env (if set), current conda env, other conda envs, local build, system paths
+    ifdef CONDA_ENV
+        SPECIFIC_CONDA_PATH := $(HOME)/miniforge3/envs/$(CONDA_ENV)
+        $(info Searching in specified conda environment: $(CONDA_ENV))
+        SEARCH_PATHS := $(SPECIFIC_CONDA_PATH) $(CONDA_PREFIX) $(HOME)/miniforge3/envs /usr/include /usr/local/include ..
+    else
+        SEARCH_PATHS := $(CONDA_PREFIX) $(HOME)/miniforge3/envs /usr/include /usr/local/include ..
+    endif
     CUOPT_HEADER_SEARCH := $(shell for path in $(SEARCH_PATHS); do find "$$path" -name "cuopt_c.h" -path "*/linear_programming/*" 2>/dev/null | head -1; done | head -1)
     ifneq ($(CUOPT_HEADER_SEARCH),)
         CUOPT_INCLUDE_DIR := $(shell dirname $(shell dirname $(shell dirname $(CUOPT_HEADER_SEARCH))))
@@ -102,14 +113,20 @@ ifndef CUOPT_INCLUDE_PATH
 endif
 
 ifndef CUOPT_LIBRARY_PATH
-    # Search order: current conda env, other conda envs, local build, system paths
-    SEARCH_PATHS := $(CONDA_PREFIX)/lib /home/tmckay/miniforge3/envs/cuopt_dev/lib /usr/lib /usr/local/lib /usr/lib64 /usr/local/lib64 ../cpp/build
+    # Search order: specific conda env (if set), current conda env, other conda envs, local build, system paths
+    ifdef CONDA_ENV
+        SPECIFIC_CONDA_LIB_PATH := $(HOME)/miniforge3/envs/$(CONDA_ENV)/lib
+        SEARCH_PATHS := $(SPECIFIC_CONDA_LIB_PATH) $(CONDA_PREFIX)/lib $(HOME)/miniforge3/envs /usr/lib /usr/local/lib /usr/lib64 /usr/local/lib64 ../cpp/build
+    else
+        SEARCH_PATHS := $(CONDA_PREFIX)/lib $(HOME)/miniforge3/envs /usr/lib /usr/local/lib /usr/lib64 /usr/local/lib64 ../cpp/build
+    endif
     CUOPT_LIBRARY_SEARCH := $(shell for path in $(SEARCH_PATHS); do find "$$path" -name "libcuopt.so" 2>/dev/null | head -1; done | head -1)
     ifneq ($(CUOPT_LIBRARY_SEARCH),)
         CUOPT_LIB_DIR := $(shell dirname $(CUOPT_LIBRARY_SEARCH))
         LDFLAGS += -L$(CUOPT_LIB_DIR)
         $(info Found cuOpt library at: $(CUOPT_LIB_DIR))
     endif
+endif
 endif
 
 # Debug target
@@ -125,5 +142,7 @@ print-vars:
 	@echo "LIBS = $(LIBS)"
 	@echo "SOURCES = $(SOURCES)"
 	@echo "OBJECTS = $(OBJECTS)"
+	@echo "CONDA_ENV = $(CONDA_ENV)"
+	@echo "CONDA_PREFIX = $(CONDA_PREFIX)"
 
 .PHONY: all clean rebuild install-deps help debug print-vars 
